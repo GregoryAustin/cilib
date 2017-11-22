@@ -3,10 +3,179 @@ package pso
 
 import _root_.scala.Predef.{any2stringadd => _}
 import PSO._
-import scalaz._
+import scalaz.{Lens=>_, _}
+import Scalaz._
 import spire.implicits._
+import spire.math.sqrt
+import monocle._
+import algebra._
 
 object Defaults {
+
+  trait NSwarms[S,A]
+  final case class Single[S,A](main: List[A]) extends NSwarms[S,A]
+  final case class Multiple[S,A](main: List[A], subs: List[(S,List[A])]) extends NSwarms[S,A]
+
+  trait HasDeviation[S,A] {
+    def _deviation: Lens[S, (Double,Double,Double)]
+  }
+
+  implicit val memMemory = new HasMemory[NicheMem[Double],Double] {
+    def _memory = Lens[NicheMem[Double],Position[Double]](_.b)(b => a => a.copy(b = b))
+  }
+
+  implicit val memVelocity = new HasVelocity[NicheMem[Double],Double] {
+    def _velocity = Lens[NicheMem[Double], Position[Double]](_.v)(b => a => a.copy(v = b))
+  }
+
+  implicit val nicheMemDeviation = new HasDeviation[NicheMem[Double],Double] {
+    def _deviation = Lens[NicheMem[Double], (Double,Double,Double)](_.deviation)(b => a => a.copy(deviation = b))
+  }
+
+  case class NicheMem[A](b: Position[A], v: Position[A], deviation: (Double,Double,Double))
+
+  def calcDeviation(x: (Double,Double,Double)) = {
+    val (a, b, c) = x
+    val mu = (a + b + c) / 3.0
+    val variance = ((a - mu) * (a - mu) + (b - mu) * (b - mu) + (c - mu) * (c - mu)) / 3.0
+    sqrt(variance)
+  }
+
+  def createSubswarm[S](xs: List[(Particle[S,Double], Boolean)]): (List[Particle[S,Double]], List[(GCParams,List[Particle[S,Double]])]) = {
+    val newMain = xs.filter(x => !x._2).map(x => x._1)
+    val subs: List[(GCParams,List[Particle[S,Double]])] = xs.filter(x => x._2).map(x => {
+      val withDistances = xs.map(p => (p._1, Algebra.distance(p._1.pos, x._1.pos)))
+      val otherParticle = withDistances.minBy(_._2)._1
+      (defaultGCParams, List(x._1, otherParticle))
+    })
+
+    (newMain, subs)
+  }
+
+  def isBetter[S](a: Particle[S,Double], b: Particle[S,Double]): Comparison => Entity[S,Double] =
+    comp => if (Comparison.fittest(a,b).apply(comp)) a else b
+
+  def getRadius[S](sub: (GCParams,List[Particle[S, Double]])): Step[Double, Double] =
+    Step.liftK { comp =>
+      val globalBest: Particle[S,Double] =
+        sub._2.reduce((a,b) => isBetter(a,b).apply(comp))
+
+      val distances =
+        sub._2.map(p => Algebra.distance(p.pos, globalBest.pos))
+
+      distances.max
+    }
+
+  def getSwarmBest[S](sub: (GCParams, List[Particle[S, Double]])) : Step[Double, Particle[S, Double]] =
+    Step.liftK { comp =>
+      val swarmBest : Particle[S,Double] =
+        sub._2.reduce((a,b) => isBetter(a,b).apply(comp))
+
+      swarmBest
+    }
+
+  def niche[S](
+                w: Double,
+                c1: Double,
+                guide: Guide[S,Double],
+                delta: Double,
+                dist: (Particle[S,Double], Particle[S,Double]) => Double
+              )(implicit M: HasMemory[S,Double], V: HasVelocity[S,Double], D: HasDeviation[S,Double]): NSwarms[GCParams,Particle[S,Double]] => Step[Double,NSwarms[GCParams,Particle[S,Double]]] =
+    swarm => {
+      val cogPSO: List[Particle[S,Double]] => Step[Double, List[Particle[S,Double]]] =
+        Iteration.sync(cognitive(w, c1, guide))
+
+      val gcPSO: List[Particle[S,Double]] => StepS[Double, GCParams, List[Particle[S,Double]]] =
+        Iteration.syncS(gcpso(w, c1, c1, Guide.pbest[S,Double]))
+
+      swarm match {
+        case Single(main) =>
+          for {
+            newMain <- cogPSO.apply(main)
+            newMain2: List[Boolean] = newMain.map(particle => {
+              val deviation: (Double,Double,Double) = D._deviation.get(particle.state)
+              val c = calcDeviation(deviation)
+              // TODO Normalise c according to the range of the search space, x_min, x_max
+              c < delta
+            })
+          } yield {
+            val (m, s) = createSubswarm(newMain.zip(newMain2))
+            Multiple(m, s)
+          }
+
+        case Multiple(main, subs) =>
+          val ss: Step[Double,NSwarms[GCParams,Particle[S,Double]]] = for {
+            newMain <- cogPSO.apply(main)
+            newMain2: List[Boolean] = newMain.map(particle => {
+              val deviation: (Double,Double,Double) = D._deviation.get(particle.state)
+              val c = calcDeviation(deviation)
+              // TODO Normalise c according to the range of the search space, x_min, x_max
+              c < delta
+            })
+            newSubs <- subs.traverse(x => {
+              val (gcparams, collection) = x
+              gcPSO.apply(collection).run(gcparams)
+            })
+
+            //shouldn't these be newSubs.traverse?
+            radii <- subs.traverse(getRadius) // radius of swarms
+            bestOfSwarms <- subs.traverse(getSwarmBest) // best of each swarm
+
+            //This returns:
+            // List[Multiple[GCParams,Particle[S,Double]]]
+            // but I want it to return
+            // List[(GCParams, List[Particle[S,Double]])]
+            // Compiler expects it to be a step for some reason...?
+            newerSubs = subs.zip(radii).zip(bestOfSwarms).map(x => {
+              val toBeMerged : List[Boolean] = subs.zip(radii).zip(bestOfSwarms).map(y => {
+                //calculation for merge: ||swarm1.best - swarm2.best|| < (swarm1.radius - swarm2.radius)
+                val ab_dist = Algebra.distance(x._2.pos, y._2.pos)
+                val radius_diff = x._1._2 - y._1._2
+                if (x._1._2 == 0 && y._1._2 == 0) {
+                  //TODO: normalize ab_dist to [0,1] so this works as expected
+                  ab_dist < 0.001  // if radii of both = 0 then this compares lbest of both
+                } else {
+                  ab_dist < radius_diff
+                }
+              })
+
+              val swarmsForMerge = subs.zip(toBeMerged).filter(x => x._2).map(x => x._1)
+              // How to handle GCParams???
+              // This won't be null because the swarm will merge with itself.
+              val gcparams = swarmsForMerge(0)._1
+              val mergedSwarm : (GCParams, List[Particle[S,Double]]) = (gcparams, swarmsForMerge.map(x => x._2).reduce((a,b) => a ++ b)) // Trying to do the same as reduce, line 72
+              //This will merge swarms, however merged swarms will be duplicates must make call to distinct
+              mergedSwarm
+            }).distinct
+
+            toBeDeleted: List[Boolean] = newMain.map(x => {
+              val absorbedTo : Boolean = subs.zip(radii).zip(bestOfSwarms).map(y => {
+                val xToY = Algebra.distance(x.pos, y._2.pos) // distance from particle in main to best in swarm
+                xToY <= y._1._2
+              }).reduceOption(_ || _).getOrElse(false)
+
+              absorbedTo
+            })
+            //deleted from mainswarm
+            newerMain = newMain.zip(toBeDeleted).filter(x => !x._2).map(x => x._1)
+
+            newestSubs : List[(GCParams, List[Particle[S,Double]])] = subs.zip(radii).zip(bestOfSwarms).map(x => {
+              val toBeAdded : List[Boolean] = newMain.map(y => {
+                val xToY = Algebra.distance(y.pos, x._2.pos)
+                xToY <= x._1._2
+              })
+
+              (x._1._1._1, x._1._1._2 ++ newMain.zip(toBeAdded).filter(z => !z._2).map(z => z._1)) // x._1((subs,radii))._1(subs)._1(gcparams)
+            })
+
+          // Absorb into subswarms from main swarm -> removes particles from main swarm
+          // Call createSubswam and do management for main swarm and the subswarms
+          } yield Multiple(newMain, newSubs) // actually the final mainswarm and the old + new subswarms
+
+          ss
+      }
+    }
+
 
   def gbest[S](
     w: Double,
@@ -24,6 +193,8 @@ object Defaults {
       p3      <- updateVelocity(p2, v)
       updated <- updatePBest(p3)
     } yield updated
+
+
 
   def cognitive[S](
     w: Double,
